@@ -3,7 +3,7 @@
 
 using namespace std;
 
-enum memStatus { NOT_ENOUGH, ENOUGH_TO_SEPARATE, ENOUGH_TO_FILL };
+enum memStatus { NOT_ENOUGH, ENOUGH_TO_CUT, ENOUGH_TO_FILL };
 
 class sAllocator
 {
@@ -38,9 +38,10 @@ public:
     unsigned size;
     bool isFree;
     
-    node* separateNextNode(size_t reqSize);
-    node* fillNextNode();
     void tryMergeWithNext();
+    node* findPrevFreeNode();
+    void separateNode(unsigned reqSize);
+    void markNodeAsUsed();
   };
   
   alignas(8) uint8_t mem[SIZE];
@@ -54,6 +55,7 @@ public:
   void* allocate(size_t reqSize);
   void deallocate(uint8_t* ptr);
   void* reallocate(uint8_t* ptr, size_t reqSize);
+  void* cpyMem(uint8_t* src, uint8_t* dest, unsigned length);
 };
 
 sAllocator* sAllocator::instance = nullptr;
@@ -69,13 +71,23 @@ int main(int argc, char *argv[])
   for(i = 0; i < 48; i++)
   {
     ptr[i] = reinterpret_cast<int*>(a->allocate(16));
+    *ptr[i] = i; 
+    cout << "space left = " << a->spaceLeft << endl;
   }
 
-  for (i = 0; i < 24; i++)
-  {
-    a->deallocate(reinterpret_cast<uint8_t*>(ptr[i * 2]));
-  }
+  cout << "number of filled nodes = " << a->numberOfFilledNodes << endl;
+  cout << "number of free nodes = " << a->numberOfFreeNodes << endl;
+  cout << "space left = " << a->spaceLeft << endl;
+
+  // for (i = 0; i < 48; i++)
+  // {
+  //   cout << *ptr[i] << endl;
+  //   a->deallocate(reinterpret_cast<uint8_t*>(ptr[i]));
+  //   cout << "space left = " << a->spaceLeft << endl;
+  // }
   
+
+  ptr[0] = reinterpret_cast<int*>(a->reallocate(reinterpret_cast<uint8_t*>(ptr[0]), 48));
 
 
   
@@ -97,50 +109,42 @@ sAllocator* sAllocator::getInstance()
 void* sAllocator::allocate(size_t reqSize)
 {
   node* currentNode;
-  node* nextNode;
   int status = NOT_ENOUGH;
 
   currentNode = instance->first;
-  nextNode = currentNode->next;
 
   if(reqSize & 8)
   {
     reqSize = reqSize - reqSize % 8 + 8;
   }
 
-  while(nextNode)
+  while(currentNode->next)
   {
-    if(nextNode->size >= reqSize + headerSize + 24)
+    currentNode = currentNode->next;
+    if(currentNode->size >= reqSize + instance->headerSize + sizeof(uint64_t))
     {
-      status = ENOUGH_TO_SEPARATE;
+      status = ENOUGH_TO_CUT;
       break;
-    }else if(nextNode->size >= reqSize)
+    }else if(currentNode->size >= reqSize)
     {
       status = ENOUGH_TO_FILL;
       break;
     }
-    currentNode = nextNode;
-    nextNode = nextNode->next;
   }
 
   switch (status)
   {
-  case ENOUGH_TO_SEPARATE:
-      if(nextNode)
-      {
-      currentNode = currentNode->separateNextNode(reqSize);
-      }
+  case ENOUGH_TO_CUT:
+      currentNode->separateNode(reqSize);
+      currentNode->markNodeAsUsed();
     break;
   
   case ENOUGH_TO_FILL:
-      if(nextNode)
-      {
-      currentNode = currentNode->fillNextNode();
-      }
+      currentNode->markNodeAsUsed();
     break;
   
   case NOT_ENOUGH:
-    cout <<"NOT ENOUGH SPACE " << endl;
+    cout << "cannot allocate: NOT ENOUGH SPACE " << endl;
     return nullptr;
     break;
   }
@@ -153,14 +157,9 @@ void* sAllocator::allocate(size_t reqSize)
 void sAllocator::deallocate(uint8_t* ptr)
 {
   node* targetNodePtr = reinterpret_cast<node*>(ptr);
-  node* prevNodePtr = instance->first;
-
   targetNodePtr--;
 
-  while(prevNodePtr->next && (prevNodePtr->next < targetNodePtr)) 
-  {
-    prevNodePtr = prevNodePtr->next;
-  }
+  node* prevNodePtr = targetNodePtr->findPrevFreeNode();
 
   targetNodePtr->isFree = true;
   targetNodePtr->next = prevNodePtr->next;
@@ -179,75 +178,157 @@ void sAllocator::deallocate(uint8_t* ptr)
   {
     prevNodePtr->tryMergeWithNext();
   }
-}
+} //sAllocator::deallocate
 
 void* sAllocator::reallocate(uint8_t* ptr, size_t reqSize)
 {
+  //nodePtr now points to the node, that contains requseted data
   node* nodePtr = reinterpret_cast<node*>(ptr);
   nodePtr--;
-  node* tempNodePtr = reinterpret_cast<node*>(reinterpret_cast<uint8_t*>(nodePtr) + instance->headerSize + nodePtr->size);
+
+  //tempNodePtr now points to the node next after nodePtr
+  node* tempNodePtr = reinterpret_cast<node*>(ptr + nodePtr->size);
   
   if(reqSize > nodePtr->size)
   {
-    if(tempNodePtr->isFree && (nodePtr->size + tempNodePtr->size + instance->headerSize > reqSize))
+    if(tempNodePtr->isFree && tempNodePtr->size >= reqSize - nodePtr->size + sizeof(uint64_t))
+    {
+      tempNodePtr->separateNode(reqSize - instance->headerSize);
+      tempNodePtr->tryMergeWithNext;
+      nodePtr++;
+      return reinterpret_cast<void*>(nodePtr);
+    }else if(tempNodePtr->isFree && nodePtr->size + tempNodePtr->size + instance->headerSize > reqSize)
     {
       nodePtr->tryMergeWithNext();
       nodePtr++;
       return reinterpret_cast<void*>(nodePtr);
     }else if(tempNodePtr = reinterpret_cast<node*>(instance->allocate(reqSize)))
     {
-      tempNodePtr--;
-      
+      nodePtr++;
+      instance->cpyMem(reinterpret_cast<uint8_t*>(nodePtr), reinterpret_cast<uint8_t*>(tempNodePtr), (nodePtr - 1)->size);
+      instance->deallocate(reinterpret_cast<uint8_t*>(nodePtr));
+      return tempNodePtr;
+    }else
+    {
+      cout << "unable to reallocate" << endl;
+      return nullptr;
     }
+  }else
+  {
+    nodePtr->separateNode(reqSize);
+    nodePtr->next->tryMergeWithNext();
+  }
+}
+
+void* sAllocator::cpyMem(uint8_t* src, uint8_t* dest, unsigned length)
+{
+  for(unsigned i = 0; i < length; i++)
+  {
+    *(dest + i) = *(src + i);
   }
 }
 
 void sAllocator::node::tryMergeWithNext()
 {
+  if(this == instance->first)
+  {
+    cout << "cannot merge first node" << endl;
+    return;
+  }
+
   node* nextNodePtr = reinterpret_cast<node*>(reinterpret_cast<uint8_t*>(this) + instance->headerSize + size);
   
   if(nextNodePtr->isFree)
   {
-    size += instance->headerSize + nextNodePtr->size;
-    next = nextNodePtr->next;
+    this->next = nextNodePtr->next;
 
     instance->numberOfFreeNodes--;
-    instance->spaceLeft += instance->headerSize;
+
+    if(this->isFree)
+    {
+      this->size += instance->headerSize + nextNodePtr->size;
+
+      instance->spaceLeft += instance->headerSize;
+    }else
+    {
+      node* prevNodePtr = this->findPrevFreeNode();
+      
+      prevNodePtr->next = this->next;
+
+      instance->spaceLeft -= nextNodePtr->size;
+    }
+  }else
+  {
+    cout << "unable to merge: next node is not empty";
   }
-}
+  
+} //sAllocator::node::tryMergeWithNext
 
-sAllocator::node* sAllocator::node::separateNextNode(size_t reqSize)
+sAllocator::node* sAllocator::node::findPrevFreeNode()
 {
-  node* temp;
+  node* tempNodePtr = instance->first;
+  
+  while(tempNodePtr->next && tempNodePtr->next < this)
+  {
+    tempNodePtr = tempNodePtr->next;
+  }
 
-  temp = reinterpret_cast<node*>(reinterpret_cast<uint8_t*>(next) + instance->headerSize + reqSize);
-  temp->next = next->next;
-  temp->isFree = true;
-  temp->size = next->size - reqSize - instance->headerSize;
+  return tempNodePtr;
+} //sAllocator::node::findPrevFreeNode
 
-  next->next = temp;
-  next->size = reqSize;
-  next->isFree = false;
-
-  temp = next;
-  next = temp->next;
-
-  instance->numberOfFilledNodes++;
-  instance->spaceLeft -= instance->headerSize + reqSize;
-
-  return temp;
-}
-
-sAllocator::node* sAllocator::node::fillNextNode()
+/* separates this node into two nodes
+ * argument reqSize is size of first node 
+ * second node is always marked as free
+ * and properly inserted into list */
+void sAllocator::node::separateNode(unsigned reqSize)
 {
-  node* temp = next;
+  if(this->size < reqSize + instance->headerSize)
+  {
+    cout << "unable to separate: node is not big enough" << endl;
+    return;
+  }
 
-  next = temp->next;
-  temp->isFree = false;
+  node* newNode;
 
-  instance->numberOfFilledNodes++;
+  newNode = reinterpret_cast<node*>(reinterpret_cast<uint8_t*>(this) + instance->headerSize + reqSize);
+  newNode->isFree = true;
+  newNode->size = this->size - reqSize - instance->headerSize;
+  this->size = reqSize;
+  this->next = newNode;
+
+  instance->numberOfFreeNodes++;
+
+  if(this->isFree)
+  {
+    newNode->next = this->next;
+
+    instance->spaceLeft -= instance->headerSize;
+
+  }else
+  {
+    node* tempNodePtr = this->findPrevFreeNode();
+    newNode->next = tempNodePtr->next;
+    tempNodePtr->next = newNode;
+
+    instance->spaceLeft += newNode->size;
+
+  }
+} //sAllocator::node::separateNode
+
+void sAllocator::node::markNodeAsUsed()
+{
+  if(!this->isFree)
+  {
+    cout << "node is already in use" << endl;
+    return;
+  }
+
+  this->isFree = false;
+  this->findPrevFreeNode()->next = this->next;
+
   instance->numberOfFreeNodes--;
-  instance->spaceLeft -= temp->size;
+  instance->numberOfFilledNodes++;
+  instance->spaceLeft -= this->size;
 
-  return temp;
-}
+  return;
+} //sAllocator::node::markNodeAsUsed
